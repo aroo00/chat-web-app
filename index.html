@@ -852,10 +852,10 @@ html, body {
 <!-- ═══════════ FIREBASE + APP LOGIC ═══════════ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getDatabase, ref, set, get, push, onValue, off, update, serverTimestamp, onDisconnect, remove }
-  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+import { getDatabase, ref, set, get, push, onValue, off, update, serverTimestamp, onDisconnect }
+from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
-// ── Firebase config ──
+/* ── Firebase ── */
 const firebaseConfig = {
   apiKey: "AIzaSyBFxSGOqg0RWj-SnR9um_sgTmb6FsEP72I",
   authDomain: "linkchat-96725.firebaseapp.com",
@@ -869,76 +869,39 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db  = getDatabase(app);
 
-// ── State ──
+/* ── STATE ── */
 let myCode = null, myName = null;
-let currentPeerCode = null, currentPeerName = null;
+let currentPeerCode = null;
 let messagesRef = null, messagesListener = null;
-let typingTimeout = null, typingRef = null;
-let contactsRef = null, contactsListener = null;
-let allContacts = [];
+let contactMsgListeners = {}; // 🔥 NEW
 
-// ── Persist session ──
+/* ── SESSION ── */
 const saved = localStorage.getItem('lc_user');
 if (saved) {
   const u = JSON.parse(saved);
   myCode = u.code; myName = u.name;
 }
 
-// ── Utils ──
+/* ── UTILS ── */
 function genCode(nic, name) {
   let h = 0;
-  const s = nic.trim().toLowerCase() + name.trim().toLowerCase();
+  const s = nic + name;
   for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
   return (Math.abs(h) % 90000 + 10000).toString();
 }
 function sessionKey(a, b) { return [a, b].sort().join('_'); }
 function fmt(ts) {
   if (!ts) return '';
-  const d = new Date(ts);
-  const now = new Date();
-  if (d.toDateString() === now.toDateString()) {
-    return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
-  }
-  return d.toLocaleDateString([], {month:'short',day:'numeric'});
-}
-function fmtTime(ts) {
-  if (!ts) return '';
   return new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 }
-function avatarColors(code) {
-  const colors = ['', 'green', 'purple', 'orange', 'pink'];
-  return colors[parseInt(code) % colors.length];
-}
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
-}
 
-// ── Toast ──
-function toast(msg) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 2500);
-}
-
-// ── Pages ──
-function showPage(id) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('show'));
-  document.getElementById(id).classList.add('show');
-}
-
-// ── REGISTER ──
+/* ── REGISTER ── */
 window.doRegister = async function() {
   const name = document.getElementById('reg-name').value.trim();
   const nic  = document.getElementById('reg-nic').value.trim();
-  if (!name) { toast('Please enter your name'); return; }
-  if (nic.length < 9) { toast('Enter a valid NIC number'); return; }
-
-  const btn = document.getElementById('reg-btn');
-  btn.disabled = true; btn.textContent = 'Creating…';
 
   const code = genCode(nic, name);
-  await set(ref(db, `users/${code}`), { name, code, createdAt: Date.now() });
+  await set(ref(db, `users/${code}`), { name, code });
 
   myCode = code; myName = name;
   localStorage.setItem('lc_user', JSON.stringify({code, name}));
@@ -946,7 +909,6 @@ window.doRegister = async function() {
   document.getElementById('show-code').textContent = code;
   document.getElementById('step-form').style.display = 'none';
   document.getElementById('step-code').style.display = 'block';
-  btn.disabled = false; btn.textContent = 'Get My App ID →';
 };
 
 window.goToContacts = function() {
@@ -954,16 +916,14 @@ window.goToContacts = function() {
   showPage('page-contacts');
 };
 
-// ── Init on load if already registered ──
-if (myCode) {
-  initContacts();
-  showPage('page-contacts');
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('show'));
+  document.getElementById(id).classList.add('show');
 }
 
-// ── CONTACTS ──
+/* ── CONTACTS ── */
 function getLocalContacts() {
-  const raw = localStorage.getItem('lc_contacts_' + myCode);
-  return raw ? JSON.parse(raw) : {};
+  return JSON.parse(localStorage.getItem('lc_contacts_' + myCode) || '{}');
 }
 function saveLocalContacts(c) {
   localStorage.setItem('lc_contacts_' + myCode, JSON.stringify(c));
@@ -971,300 +931,133 @@ function saveLocalContacts(c) {
 
 function initContacts() {
   document.getElementById('my-id-badge').textContent = 'ID: ' + myCode;
-  renderContactsList();
+  renderContacts();
 
-  // Online presence
   const presRef = ref(db, `presence/${myCode}`);
-  set(presRef, { online: true, lastSeen: serverTimestamp(), name: myName });
-  onDisconnect(presRef).set({ online: false, lastSeen: serverTimestamp(), name: myName });
+  set(presRef, { online: true });
+  onDisconnect(presRef).set({ online: false });
 }
 
-async function renderContactsList(filter = '') {
-  const localContacts = getLocalContacts();
-  const codes = Object.keys(localContacts);
-  allContacts = [];
-
+/* 🔥 REALTIME CONTACT LIST */
+function renderContacts() {
+  const contacts = getLocalContacts();
   const el = document.getElementById('contacts-list');
 
-  if (codes.length === 0) {
-    el.innerHTML = `<div class="empty-state">
-      <div class="empty-icon">👥</div>
-      <div class="empty-title">No contacts yet</div>
-      <div class="empty-sub">Tap ✎ to add someone using their App ID</div>
-    </div>`;
+  const codes = Object.keys(contacts);
+  if (!codes.length) {
+    el.innerHTML = `<div class="empty-state">No contacts</div>`;
     return;
   }
 
-  // Load last messages & presence for each contact
-  const contactData = await Promise.all(codes.map(async code => {
-    const nick = localContacts[code];
-    let lastName = nick;
-    // Try to get real name from Firebase
-    try {
-      const snap = await get(ref(db, `users/${code}`));
-      if (snap.exists()) lastName = snap.val().name;
-    } catch(e) {}
-
-    // Last message
-    let lastMsg = '', lastTime = 0, unread = 0;
-    try {
-      const sk = sessionKey(myCode, code);
-      const snap = await get(ref(db, `messages/${sk}`));
-      if (snap.exists()) {
-        const msgs = Object.values(snap.val());
-        msgs.sort((a,b) => a.ts - b.ts);
-        const last = msgs[msgs.length - 1];
-        lastMsg = last.text;
-        lastTime = last.ts;
-        unread = msgs.filter(m => m.from !== myCode && !m.read).length;
-      }
-    } catch(e) {}
-
-    return { code, nick, realName: lastName, lastMsg, lastTime, unread };
-  }));
-
-  contactData.sort((a,b) => b.lastTime - a.lastTime);
-  allContacts = contactData;
-
-  renderFilteredContacts(filter, contactData);
-}
-
-function renderFilteredContacts(filter, data) {
-  const el = document.getElementById('contacts-list');
-  const filtered = filter
-    ? data.filter(c => c.nick.toLowerCase().includes(filter.toLowerCase()) || c.code.includes(filter))
-    : data;
-
-  if (filtered.length === 0) {
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-title">No results</div></div>`;
-    return;
-  }
-
-  el.innerHTML = `<div class="section-label">Chats</div>` + filtered.map(c => `
-    <div class="contact-item" onclick="openChat('${c.code}','${esc(c.nick)}')">
-      <div class="avatar ${avatarColors(c.code)}" id="av-${c.code}">
-        ${c.nick.charAt(0).toUpperCase()}
-        <div class="online-dot" id="dot-${c.code}" style="display:none"></div>
-      </div>
+  el.innerHTML = codes.map(code => `
+    <div class="contact-item" id="c-${code}" onclick="openChat('${code}')">
+      <div class="avatar">${contacts[code][0]}</div>
       <div class="contact-info">
-        <div class="contact-name">${esc(c.nick)}</div>
-        <div class="contact-preview">${c.lastMsg ? esc(c.lastMsg.substring(0,50)) : 'Tap to chat'}</div>
+        <div class="contact-name">${contacts[code]}</div>
+        <div class="contact-preview" id="p-${code}">...</div>
       </div>
       <div class="contact-meta">
-        <div class="contact-time">${c.lastTime ? fmt(c.lastTime) : ''}</div>
-        ${c.unread > 0 ? `<div class="unread-badge">${c.unread}</div>` : ''}
+        <div class="contact-time" id="t-${code}"></div>
       </div>
     </div>
   `).join('');
 
-  // Listen for presence
-  filtered.forEach(c => {
-    onValue(ref(db, `presence/${c.code}`), snap => {
-      const dot = document.getElementById('dot-' + c.code);
-      if (dot && snap.exists() && snap.val().online) {
-        dot.style.display = 'block';
-      } else if (dot) {
-        dot.style.display = 'none';
+  /* 🔥 LISTEN FOR EACH CHAT */
+  codes.forEach(code => {
+    const sk = sessionKey(myCode, code);
+    const msgRef = ref(db, `messages/${sk}`);
+
+    if (contactMsgListeners[code]) {
+      off(msgRef, 'value', contactMsgListeners[code]);
+    }
+
+    contactMsgListeners[code] = onValue(msgRef, snap => {
+      if (!snap.exists()) return;
+
+      const msgs = Object.values(snap.val());
+      msgs.sort((a,b) => a.ts - b.ts);
+
+      const last = msgs[msgs.length - 1];
+      const unread = msgs.filter(m => m.from !== myCode && !m.read).length;
+
+      document.getElementById(`p-${code}`).textContent = last.text;
+      document.getElementById(`t-${code}`).textContent = fmt(last.ts);
+
+      let badge = document.querySelector(`#c-${code} .unread-badge`);
+
+      if (unread > 0) {
+        if (!badge) {
+          badge = document.createElement('div');
+          badge.className = 'unread-badge';
+          document.querySelector(`#c-${code} .contact-meta`).appendChild(badge);
+        }
+        badge.textContent = unread;
+      } else if (badge) {
+        badge.remove();
       }
     });
   });
 }
 
-window.filterContacts = function(val) {
-  renderFilteredContacts(val, allContacts);
-};
-
-// ── ADD CONTACT ──
-window.openAddContact = function() {
-  document.getElementById('add-code').value = '';
-  document.getElementById('add-nick').value = '';
-  document.getElementById('modal-add').classList.add('show');
-};
-
+/* ── ADD CONTACT ── */
 window.addContact = async function() {
-  const code = document.getElementById('add-code').value.trim();
-  const nick = document.getElementById('add-nick').value.trim();
+  const code = document.getElementById('add-code').value;
+  const nick = document.getElementById('add-nick').value;
 
-  if (code.length !== 5) { toast('Enter a valid 5-digit App ID'); return; }
-  if (code === myCode) { toast("That's your own App ID!"); return; }
-
-  // Check if user exists
   const snap = await get(ref(db, `users/${code}`));
-  if (!snap.exists()) { toast('No user found with that App ID'); return; }
-
-  const realName = snap.val().name;
-  const displayName = nick || realName;
+  if (!snap.exists()) return alert("No user");
 
   const local = getLocalContacts();
-  local[code] = displayName;
+  local[code] = nick || snap.val().name;
   saveLocalContacts(local);
 
-  document.getElementById('modal-add').classList.remove('show');
-  toast('Contact added!');
-  renderContactsList();
-  openChat(code, displayName);
+  renderContacts();
 };
 
-// ── OPEN CHAT ──
-window.openChat = function(peerCode, peerName) {
+/* ── CHAT ── */
+window.openChat = function(peerCode) {
   currentPeerCode = peerCode;
-  currentPeerName = peerName;
-
-  document.getElementById('chat-peer-name').textContent = peerName;
-  document.getElementById('chat-avatar').textContent = peerName.charAt(0).toUpperCase();
-  document.getElementById('chat-avatar').className = 'chat-topbar-avatar ' + avatarColors(peerCode);
-
   showPage('page-chat');
 
-  // Mark messages read
   const sk = sessionKey(myCode, peerCode);
-  const msgsRef = ref(db, `messages/${sk}`);
+  const msgRef = ref(db, `messages/${sk}`);
 
-  // Listen to messages
-  if (messagesListener) off(messagesRef, 'value', messagesListener);
-  messagesRef = msgsRef;
-  messagesListener = onValue(msgsRef, snap => {
+  if (messagesListener) off(messagesRef);
+  messagesRef = msgRef;
+
+  messagesListener = onValue(msgRef, snap => {
     const wrap = document.getElementById('messages-wrap');
-    if (!snap.exists()) {
-      wrap.innerHTML = `<div class="empty-state"><div class="empty-icon">👋</div><div class="empty-title">Say hello!</div><div class="empty-sub">Start the conversation</div></div>`;
-      return;
-    }
+    if (!snap.exists()) return;
 
-    const msgs = Object.entries(snap.val()).map(([id, v]) => ({id, ...v}));
+    const msgs = Object.values(snap.val());
     msgs.sort((a,b) => a.ts - b.ts);
 
-    // Mark incoming as read
-    msgs.forEach(m => {
-      if (m.from !== myCode && !m.read) {
-        update(ref(db, `messages/${sk}/${m.id}`), { read: true });
-      }
-    });
+    wrap.innerHTML = msgs.map(m => `
+      <div class="msg-row ${m.from === myCode ? 'me':'them'}">
+        <div class="bubble">${m.text}</div>
+      </div>
+    `).join('');
 
-    let html = '';
-    let lastDate = '';
-    msgs.forEach(m => {
-      if (m.system) {
-        html += `<div class="system-bubble">${esc(m.text)}</div>`;
-        return;
-      }
-      const d = new Date(m.ts).toDateString();
-      if (d !== lastDate) {
-        lastDate = d;
-        const label = new Date(m.ts).toDateString() === new Date().toDateString() ? 'Today' :
-          new Date(m.ts).toLocaleDateString([], {weekday:'long', month:'short', day:'numeric'});
-        html += `<div class="date-divider"><span>${label}</span></div>`;
-      }
-      const isMe = m.from === myCode;
-      const tick = isMe ? `<span class="tick ${m.read ? 'read' : ''}">✓✓</span>` : '';
-      html += `<div class="msg-row ${isMe ? 'me' : 'them'}">
-        <div class="bubble">${esc(m.text)}</div>
-        <div class="msg-meta">${fmtTime(m.ts)} ${tick}</div>
-      </div>`;
-    });
-
-    wrap.innerHTML = html;
     wrap.scrollTop = wrap.scrollHeight;
   });
-
-  // Presence
-  onValue(ref(db, `presence/${peerCode}`), snap => {
-    const el = document.getElementById('chat-peer-status');
-    if (snap.exists() && snap.val().online) {
-      el.textContent = 'online';
-      el.className = 'chat-topbar-status';
-    } else {
-      const ls = snap.exists() && snap.val().lastSeen;
-      el.textContent = ls ? 'last seen ' + fmt(ls) : 'offline';
-      el.className = 'chat-topbar-status offline';
-    }
-  });
-
-  // Typing
-  typingRef = ref(db, `typing/${sessionKey(myCode, peerCode)}/${peerCode}`);
-  onValue(typingRef, snap => {
-    const ti = document.getElementById('typing-indicator');
-    if (snap.exists() && snap.val()) {
-      ti.classList.add('show');
-      document.getElementById('messages-wrap').scrollTop = 99999;
-    } else {
-      ti.classList.remove('show');
-    }
-  });
 };
 
-// ── SEND MESSAGE ──
 window.sendMsg = async function() {
-  const input = document.getElementById('chat-input');
-  const text = input.value.trim();
-  if (!text || !currentPeerCode) return;
+  const text = document.getElementById('chat-input').value;
+  if (!text) return;
 
   const sk = sessionKey(myCode, currentPeerCode);
-  const msgRef = push(ref(db, `messages/${sk}`));
-  await set(msgRef, { from: myCode, text, ts: Date.now(), read: false });
 
-  // Add to each other's contacts if not there
-  const local = getLocalContacts();
-  if (!local[currentPeerCode]) {
-    const snap = await get(ref(db, `users/${currentPeerCode}`));
-    local[currentPeerCode] = snap.exists() ? snap.val().name : currentPeerCode;
-    saveLocalContacts(local);
-  }
+  await set(push(ref(db, `messages/${sk}`)), {
+    from: myCode,
+    text,
+    ts: Date.now(),
+    read: false
+  });
 
-  // Clear typing
-  if (typingRef) set(ref(db, `typing/${sk}/${myCode}`), false);
-
-  input.value = '';
-  input.style.height = 'auto';
-};
-
-// ── TYPING INDICATOR ──
-window.onTyping = function(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-
-  if (!currentPeerCode) return;
-  const sk = sessionKey(myCode, currentPeerCode);
-  set(ref(db, `typing/${sk}/${myCode}`), true);
-  clearTimeout(typingTimeout);
-  typingTimeout = setTimeout(() => set(ref(db, `typing/${sk}/${myCode}`), false), 2000);
-};
-
-window.handleMsgKey = function(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
-};
-
-// ── BACK ──
-window.goBack = function() {
-  if (messagesListener && messagesRef) off(messagesRef, 'value', messagesListener);
-  currentPeerCode = null; currentPeerName = null;
-  document.getElementById('typing-indicator').classList.remove('show');
-  renderContactsList();
-  showPage('page-contacts');
-};
-
-// ── RENAME ──
-window.openRename = function() {
-  document.getElementById('rename-input').value = currentPeerName;
-  document.getElementById('modal-rename').classList.add('show');
-};
-window.saveRename = function() {
-  const newName = document.getElementById('rename-input').value.trim();
-  if (!newName) { toast('Enter a name'); return; }
-  const local = getLocalContacts();
-  local[currentPeerCode] = newName;
-  saveLocalContacts(local);
-  currentPeerName = newName;
-  document.getElementById('chat-peer-name').textContent = newName;
-  document.getElementById('modal-rename').classList.remove('show');
-  toast('Contact renamed!');
-};
-
-// ── MODAL CLOSE ──
-window.closeModal = function(id, e) {
-  if (e.target.classList.contains('modal-overlay')) {
-    document.getElementById(id).classList.remove('show');
-  }
+  document.getElementById('chat-input').value = '';
 };
 </script>
+
 </body>
 </html>
